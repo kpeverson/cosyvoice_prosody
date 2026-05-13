@@ -1,8 +1,6 @@
 # CosyVoice2 with Prosody Conditioning
 
-Fork of [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice) extending CosyVoice2 with prosody conditioning.
-
-See the [upstream README](https://github.com/FunAudioLLM/CosyVoice) for setup and general usage.
+Fork of [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice) extending CosyVoice2 with prosody conditioning. See the [upstream README](https://github.com/FunAudioLLM/CosyVoice) for setup and general usage.
 
 ---
 
