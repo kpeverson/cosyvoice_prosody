@@ -265,6 +265,8 @@ class Qwen2LM(TransformerLM):
             length_normalized_loss: bool = True,
             lsm_weight: float = 0.0,
             mix_ratio: List[int] = [5, 15],
+            num_prosody_tokens: int = 0,
+            prosody_mix_ratio: int = 0,
     ):
         torch.nn.Module.__init__(self)
         self.llm_input_size = llm_input_size
@@ -292,6 +294,7 @@ class Qwen2LM(TransformerLM):
         # 4. sampling method
         self.sampling = sampling
         self.mix_ratio = mix_ratio
+        self.prosody_mix_ratio = prosody_mix_ratio
 
         # 5. vllm related
         self.stop_token_ids = [speech_token_size + i for i in range(3)]
@@ -299,7 +302,52 @@ class Qwen2LM(TransformerLM):
         if online_feature is True:
             self.speech_token_extractor = SpeechTokenExtractor(model_path=os.path.join(onnx_path, 'speech_tokenizer_v2.batch.onnx'))
 
-    def prepare_lm_input_target(self, sos_emb, text_token, text_token_emb, text_token_len, task_id_emb, speech_token, speech_token_emb, speech_token_len, instruct_token=None, instruct_token_emb=None, instruct_token_len=None):
+        # 6. prosody token related
+        if num_prosody_tokens > 0:
+            self.prosody_embedding = torch.nn.Embedding(num_prosody_tokens, llm_input_size)
+            self.prosody_sep_embedding = torch.nn.Embedding(1, llm_input_size)
+
+    def init_prosody_encoder(self, prosody_encoder_path: str, prosody_feat_dim: int = 768,
+                              prosody_pool_factor: int = 5):
+        """Load a frozen ProsodyEncoder for continuous prosody feature extraction (option 3).
+
+        Call this AFTER __init__ when continuous prosody features are needed.
+        Creates self.prosody_proj (Linear) and self.prosody_encoder (frozen).
+        A prosody_sep_embedding is also created if not already present.
+        """
+        from cosyvoice.prosody.prosody_encoder import ProsodyEncoder
+        self.prosody_encoder = ProsodyEncoder.from_checkpoint(prosody_encoder_path)
+        for p in self.prosody_encoder.parameters():
+            p.requires_grad_(False)
+        self.prosody_proj = torch.nn.Linear(prosody_feat_dim, self.llm_input_size)
+        self.prosody_pool_factor = prosody_pool_factor
+        if not hasattr(self, 'prosody_sep_embedding'):
+            self.prosody_sep_embedding = torch.nn.Embedding(1, self.llm_input_size)
+
+    def extract_prosody_emb(self, glottal_16k: torch.Tensor,
+                             glottal_16k_len: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Extract and project continuous prosody features from 16 kHz glottal source.
+
+        Args:
+            glottal_16k:     [B, T] float32 at 16 kHz.
+            glottal_16k_len: [B] int32 valid lengths (optional).
+        Returns:
+            [B, T', llm_input_size] prosody embeddings at ~12.5 Hz.
+        """
+        padding_mask = None
+        if glottal_16k_len is not None:
+            max_len = glottal_16k.shape[1]
+            padding_mask = torch.arange(max_len, device=glottal_16k.device).unsqueeze(0) >= glottal_16k_len.unsqueeze(1)
+        with torch.no_grad():
+            feats, _ = self.prosody_encoder(glottal_16k, padding_mask)  # [B, T', 768]
+        # Mean-pool to reduce rate (e.g. 62.5 Hz -> 12.5 Hz with factor=5)
+        if self.prosody_pool_factor > 1:
+            B, T, D = feats.shape
+            T_out = T // self.prosody_pool_factor
+            feats = feats[:, :T_out * self.prosody_pool_factor, :].view(B, T_out, self.prosody_pool_factor, D).mean(dim=2)
+        return self.prosody_proj(feats)  # [B, T', llm_input_size]
+
+    def prepare_lm_input_target(self, sos_emb, text_token, text_token_emb, text_token_len, task_id_emb, speech_token, speech_token_emb, speech_token_len, instruct_token=None, instruct_token_emb=None, instruct_token_len=None, prosody_token_emb=None, prosody_token_len=None):
         lm_target, lm_input = [], []
         text_token = unpad_sequence(text_token, text_token_len.cpu(), batch_first=True)
         speech_token = unpad_sequence(speech_token, speech_token_len.cpu(), batch_first=True)
@@ -313,34 +361,70 @@ class Qwen2LM(TransformerLM):
             instruct_token = [torch.empty(0).to(text_token[0])] * len(text_token)
             instruct_token_emb = [torch.empty(0, 896).to(text_token_emb[0])] * len(text_token)
             instruct_token_len = torch.zeros(len(text_token)).to(text_token_len)
+        # optional prosody conditioning — empty tensors when absent
+        use_prosody = prosody_token_emb is not None and prosody_token_len is not None
+        if use_prosody:
+            prosody_token_emb = unpad_sequence(prosody_token_emb, prosody_token_len.cpu(), batch_first=True)
+        else:
+            prosody_token_emb = [torch.empty(0, text_token_emb[0].size(-1)).to(text_token_emb[0])] * len(text_token)
+            prosody_token_len = torch.zeros(len(text_token)).to(text_token_len)
+        N, M = self.mix_ratio[0], self.mix_ratio[1]
+        L = self.prosody_mix_ratio if use_prosody else 0
         for i in range(len(text_token)):
-            # bistream sequence
-            if random.random() < 0.5 and speech_token_len[i] / text_token_len[i] > self.mix_ratio[1] / self.mix_ratio[0]:
+            # bistream: enabled when either (a) no prosody, or (b) prosody with L>0
+            bistream_eligible = (not use_prosody or L > 0) and \
+                                random.random() < 0.5 and \
+                                speech_token_len[i] / text_token_len[i] > M / N
+            if bistream_eligible:
                 this_lm_target, this_lm_input = [IGNORE_ID], [sos_emb.squeeze(dim=0)]
-                this_lm_target += [IGNORE_ID] * instruct_token_len[i]
+                this_lm_target += [IGNORE_ID] * int(instruct_token_len[i].item())
                 this_lm_input.append(instruct_token_emb[i])
-                for j in range(((text_token_len[i] + 1) / self.mix_ratio[0]).ceil().int().item()):
-                    this_text_token = text_token[i][j * self.mix_ratio[0]: (j + 1) * self.mix_ratio[0]].tolist()
-                    this_speech_token = speech_token[i][j * self.mix_ratio[1]: (j + 1) * self.mix_ratio[1]].tolist()
-                    if len(this_text_token) == self.mix_ratio[0]:
-                        assert len(this_speech_token) == self.mix_ratio[1]
-                        this_lm_target += [IGNORE_ID] * (self.mix_ratio[0] - 1)
+                for j in range(((text_token_len[i] + 1) / N).ceil().int().item()):
+                    this_text_token = text_token[i][j * N: (j + 1) * N].tolist()
+                    this_speech_token = speech_token[i][j * M: (j + 1) * M].tolist()
+                    if len(this_text_token) == N:
+                        # full chunk: [N text][L prosody][M speech] →
+                        # target: (N-1+L) IGNORE + M speech + fill_token
+                        assert len(this_speech_token) == M
+                        this_lm_target += [IGNORE_ID] * (N - 1 + L)
                         this_lm_target += this_speech_token
                         this_lm_target.append(self.fill_token)
-                        this_lm_input.append(text_token_emb[i][j * self.mix_ratio[0]: (j + 1) * self.mix_ratio[0]])
-                        this_lm_input.append(speech_token_emb[i][j * self.mix_ratio[1]: (j + 1) * self.mix_ratio[1]])
+                        this_lm_input.append(text_token_emb[i][j * N: (j + 1) * N])
+                        if L > 0:
+                            this_lm_input.append(prosody_token_emb[i][j * L: (j + 1) * L])
+                        this_lm_input.append(speech_token_emb[i][j * M: (j + 1) * M])
                     else:
-                        this_lm_target += [-1] * len(this_text_token)
-                        this_lm_target += speech_token[i][j * self.mix_ratio[1]:].tolist()
+                        # last chunk: [<N text][remaining prosody][task_id][remaining speech][EOS]
+                        # target: k IGNORE + p IGNORE + remaining speech + EOS
+                        p = prosody_token_emb[i][j * L:].shape[0] if L > 0 else 0
+                        this_lm_target += [IGNORE_ID] * len(this_text_token)
+                        this_lm_target += [IGNORE_ID] * p
+                        this_lm_target += speech_token[i][j * M:].tolist()
                         this_lm_target.append(self.eos_token)
-                        this_lm_input.append(text_token_emb[i][j * self.mix_ratio[0]:])
+                        this_lm_input.append(text_token_emb[i][j * N:])
+                        if L > 0:
+                            this_lm_input.append(prosody_token_emb[i][j * L:])
                         this_lm_input.append(task_id_emb.squeeze(dim=0))
-                        this_lm_input.append(speech_token_emb[i][j * self.mix_ratio[1]:])
+                        this_lm_input.append(speech_token_emb[i][j * M:])
                 this_lm_target, this_lm_input = torch.tensor(this_lm_target), torch.concat(this_lm_input, dim=0)
-            # unistream sequence
             else:
-                this_lm_target = torch.tensor([IGNORE_ID] * (1 + instruct_token_len[i] + text_token_len[i]) + speech_token[i].tolist() + [self.eos_token])
-                this_lm_input = torch.concat([sos_emb.squeeze(dim=0), instruct_token_emb[i], text_token_emb[i], task_id_emb.squeeze(dim=0), speech_token_emb[i]], dim=0)
+                # unistream sequence
+                # +1 for prosody separator token when prosody is active
+                prosody_sep_len = 1 if use_prosody else 0
+                this_lm_target = torch.tensor(
+                    [IGNORE_ID] * (1 + instruct_token_len[i] + text_token_len[i] + prosody_sep_len + prosody_token_len[i]) + speech_token[i].tolist() + [self.eos_token]
+                )
+                parts = [
+                    sos_emb.squeeze(dim=0),
+                    instruct_token_emb[i],
+                    text_token_emb[i],
+                ]
+                if use_prosody:
+                    sep_idx = torch.zeros(1, dtype=torch.long, device=text_token_emb[i].device)
+                    parts.append(self.prosody_sep_embedding(sep_idx))
+                    parts.append(prosody_token_emb[i])
+                parts += [task_id_emb.squeeze(dim=0), speech_token_emb[i]]
+                this_lm_input = torch.concat(parts, dim=0)
             lm_target.append(this_lm_target)
             lm_input.append(this_lm_input)
         lm_input_len = torch.tensor([i.size(0) for i in lm_input], dtype=torch.int32)
@@ -391,11 +475,46 @@ class Qwen2LM(TransformerLM):
             lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, text_token, text_token_emb, text_token_len, task_id_emb,
                                                                              speech_token, speech_token_emb, speech_token_len, instruct_token, instruct_token_emb, instruct_token_len)
         elif self.__class__.__name__ == 'Qwen2LM':
+            if 'glottal_16k' in batch and hasattr(self, 'prosody_encoder'):
+                # Option 3: continuous prosody features extracted on-the-fly
+                glottal = batch['glottal_16k'].to(device)
+                glottal_len = batch['glottal_16k_len'].to(device)
+                prosody_token_emb = self.extract_prosody_emb(glottal, glottal_len)
+                prosody_token_len = torch.tensor(
+                    [prosody_token_emb.shape[1]] * prosody_token_emb.shape[0],
+                    dtype=torch.int32, device=device)
+            elif 'prosody_token' in batch and hasattr(self, 'prosody_embedding'):
+                # Option 2: discrete prosody tokens
+                prosody_token = batch['prosody_token'].to(device)
+                prosody_token_len = batch['prosody_token_len'].to(device)
+                prosody_token_emb = self.prosody_embedding(prosody_token)
+            else:
+                prosody_token_emb = prosody_token_len = None
             lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, text_token, text_token_emb, text_token_len, task_id_emb,
-                                                                             speech_token, speech_token_emb, speech_token_len)
+                                                                             speech_token, speech_token_emb, speech_token_len,
+                                                                             prosody_token_emb=prosody_token_emb, prosody_token_len=prosody_token_len)
         else:
             raise ValueError
         lm_target = lm_target.to(device)
+
+        # DEBUG: inspect LM input shapes and token positions — remove before real training
+        if os.environ.get('COSYVOICE_DEBUG_LM_INPUT') == '1':
+            import sys
+            b = 0  # inspect first sample in batch
+            print('\n=== LM INPUT DEBUG (sample 0) ===')
+            print(f'  text_token:        shape={text_token.shape}  len={text_token_len[b].item()}  ids={text_token[b, :text_token_len[b]].tolist()}')
+            if prosody_token_emb is not None:
+                pt = batch["prosody_token"]
+                print(f'  prosody_token:     shape={pt.shape}  len={prosody_token_len[b].int().item()}  ids={pt[b, :prosody_token_len[b].int()].tolist()}')
+            else:
+                print('  prosody_token:     NOT present in batch')
+            print(f'  speech_token:      shape={speech_token.shape}  len={speech_token_len[b].item()}')
+            print(f'  lm_input:          shape={lm_input.shape}  seq_len[0]={lm_input_len[b].item()}')
+            print(f'  lm_target:         shape={lm_target.shape}')
+            print(f'  lm_target[0] non-IGNORE positions: {(lm_target[b] != -1).sum().item()} tokens')
+            print('=================================\n')
+            sys.stdout.flush()
+            raise SystemExit(0)
 
         # 4. run lm forward
         lm_output, lm_output_mask = self.llm(lm_input, lm_input_len.to(device))
@@ -469,6 +588,9 @@ class Qwen2LM(TransformerLM):
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
             uuid: str = '',
+            prosody_token: Optional[torch.Tensor] = None,
+            prosody_token_len: Optional[torch.Tensor] = None,
+            glottal_16k: Optional[torch.Tensor] = None,
     ) -> Generator[torch.Tensor, None, None]:
         device = text.device
         text = torch.concat([prompt_text, text], dim=1)
@@ -491,7 +613,22 @@ class Qwen2LM(TransformerLM):
             prompt_speech_token_emb = self.speech_embedding(prompt_speech_token)
         else:
             prompt_speech_token_emb = torch.zeros(1, 0, self.llm_input_size, dtype=text_emb.dtype).to(device)
-        lm_input = torch.concat([sos_emb, text_emb, task_id_emb, prompt_speech_token_emb], dim=1)
+
+        # Determine prosody embedding: option 3 (continuous) > option 2 (discrete) > none
+        if glottal_16k is not None and hasattr(self, 'prosody_encoder'):
+            prosody_emb = self.extract_prosody_emb(glottal_16k.to(device))  # [1, T', D]
+        elif (prosody_token is not None and prosody_token_len is not None
+              and hasattr(self, 'prosody_embedding') and prosody_token_len > 0):
+            prosody_emb = self.prosody_embedding(prosody_token)  # [1, L, D]
+        else:
+            prosody_emb = None
+
+        if prosody_emb is not None:
+            sep_idx = torch.zeros(1, dtype=torch.long, device=device)
+            sep_emb = self.prosody_sep_embedding(sep_idx).reshape(1, 1, -1)
+            lm_input = torch.concat([sos_emb, text_emb, sep_emb, prosody_emb, task_id_emb, prompt_speech_token_emb], dim=1)
+        else:
+            lm_input = torch.concat([sos_emb, text_emb, task_id_emb, prompt_speech_token_emb], dim=1)
 
         # 4. cal min/max_length
         min_len = int((text_len - prompt_text_len) * min_token_text_ratio)

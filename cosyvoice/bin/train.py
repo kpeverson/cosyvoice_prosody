@@ -50,6 +50,7 @@ def get_args():
     parser.add_argument('--cv_data', required=True, help='cv data file')
     parser.add_argument('--qwen_pretrain_path', required=False, help='qwen pretrain path')
     parser.add_argument('--onnx_path', required=False, help='onnx path, which is required for online feature extraction')
+    parser.add_argument('--prosody_encoder_path', default='', help='path to prosodyenc_weights.pt for option-3 continuous prosody feature training')
     parser.add_argument('--checkpoint', help='checkpoint model')
     parser.add_argument('--model_dir', required=True, help='save model dir')
     parser.add_argument('--tensorboard_dir',
@@ -131,6 +132,15 @@ def main():
     if args.dpo is True:
         configs[args.model].forward = configs[args.model].forward_dpo
     model = configs[args.model]
+
+    # Option 3: attach frozen prosody encoder for continuous feature conditioning
+    if args.prosody_encoder_path:
+        if args.model == 'llm':
+            model.init_prosody_encoder(args.prosody_encoder_path)
+        elif args.model == 'flow':
+            model.encoder.init_prosody_encoder(args.prosody_encoder_path)
+        logging.info('Loaded prosody encoder from {}'.format(args.prosody_encoder_path))
+
     start_step, start_epoch = 0, -1
     if args.checkpoint is not None:
         if os.path.exists(args.checkpoint):

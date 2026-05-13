@@ -208,9 +208,33 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
-        # text encode
-        h, h_lengths = self.encoder(token, token_len, streaming=streaming)
+        # text encode (with optional prosody cross-attention)
+        prosody_token = batch.get('prosody_token', None)
+        prosody_token_len = batch.get('prosody_token_len', None)
+        glottal_16k = batch.get('glottal_16k', None)
+        glottal_16k_len = batch.get('glottal_16k_len', None)
+        if prosody_token is not None:
+            prosody_token = prosody_token.to(device)
+            prosody_token_len = prosody_token_len.to(device)
+        if glottal_16k is not None:
+            glottal_16k = glottal_16k.to(device)
+            glottal_16k_len = glottal_16k_len.to(device)
+        h, h_lengths = self.encoder(token, token_len, streaming=streaming,
+                                    prosody_token=prosody_token,
+                                    prosody_token_len=prosody_token_len,
+                                    glottal_16k=glottal_16k,
+                                    glottal_16k_len=glottal_16k_len)
         h = self.encoder_proj(h)
+
+        # Trim feat/feat_len to encoder output length.
+        # Source audio stored below the target sample rate (e.g. 16 kHz stored,
+        # resampled to 24 kHz) causes the mel frame count to differ from
+        # token_len * token_mel_ratio by 1-2 frames. The encoder output is
+        # always exactly token_len * token_mel_ratio, so we treat it as canonical.
+        h_len = h.shape[1]
+        if feat.shape[1] != h_len:
+            feat = feat[:, :h_len, :]
+            feat_len = torch.clamp(feat_len, max=h_len)
 
         # get conditions
         conds = torch.zeros(feat.shape, device=token.device)
@@ -221,7 +245,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             conds[i, :index] = feat[i, :index]
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(h_lengths.sum(dim=-1).squeeze(dim=1))).to(h)
+        mask = (~make_pad_mask(feat_len)).to(h)
         loss, _ = self.decoder.compute_loss(
             feat.transpose(1, 2).contiguous(),
             mask.unsqueeze(1),
@@ -242,7 +266,11 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat_len,
                   embedding,
                   streaming,
-                  finalize):
+                  finalize,
+                  prosody_token=None,
+                  prosody_token_len=None,
+                  glottal_16k=None,
+                  glottal_16k_len=None):
         assert token.shape[0] == 1
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
@@ -253,12 +281,20 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
-        # text encode
+        # text encode (with optional prosody cross-attention)
         if finalize is True:
-            h, h_lengths = self.encoder(token, token_len, streaming=streaming)
+            h, h_lengths = self.encoder(token, token_len, streaming=streaming,
+                                        prosody_token=prosody_token,
+                                        prosody_token_len=prosody_token_len,
+                                        glottal_16k=glottal_16k,
+                                        glottal_16k_len=glottal_16k_len)
         else:
             token, context = token[:, :-self.pre_lookahead_len], token[:, -self.pre_lookahead_len:]
-            h, h_lengths = self.encoder(token, token_len, context=context, streaming=streaming)
+            h, h_lengths = self.encoder(token, token_len, context=context, streaming=streaming,
+                                        prosody_token=prosody_token,
+                                        prosody_token_len=prosody_token_len,
+                                        glottal_16k=glottal_16k,
+                                        glottal_16k_len=glottal_16k_len)
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
 

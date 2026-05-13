@@ -14,15 +14,37 @@
 # limitations under the License.
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import numpy as np
 import onnxruntime
 import torch
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 from tqdm import tqdm
 
+# Thread-local HDF5 handles so each thread opens its own file descriptor.
+_thread_local = threading.local()
+
+
+def _get_h5():
+    if not hasattr(_thread_local, 'h5_file'):
+        import h5py
+        _thread_local.h5_file = h5py.File(args.hdf5_file, 'r')
+    return _thread_local.h5_file
+
 
 def single_job(utt):
-    audio, sample_rate = torchaudio.load(utt2wav[utt])
+    try:
+        if args.hdf5_file:
+            arr = np.array(_get_h5()[utt][:], dtype=np.float32)
+            audio = torch.from_numpy(arr)
+            if arr.ndim == 1:
+                audio = audio.unsqueeze(0)  # [1, T]
+            sample_rate = args.sample_rate
+        else:
+            audio, sample_rate = torchaudio.load(utt2wav[utt])
+    except KeyError:
+        return utt, None
     if sample_rate != 16000:
         audio = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(audio)
     feat = kaldi.fbank(audio,
@@ -35,15 +57,22 @@ def single_job(utt):
 
 
 def main(args):
-    all_task = [executor.submit(single_job, utt) for utt in utt2wav.keys()]
+    utt_list = list(utt2wav.keys())
+    all_task = [executor.submit(single_job, utt) for utt in utt_list]
     utt2embedding, spk2embedding = {}, {}
-    for future in tqdm(as_completed(all_task)):
+    skipped = 0
+    for future in tqdm(as_completed(all_task), total=len(all_task)):
         utt, embedding = future.result()
+        if embedding is None:
+            skipped += 1
+            continue
         utt2embedding[utt] = embedding
         spk = utt2spk[utt]
         if spk not in spk2embedding:
             spk2embedding[spk] = []
         spk2embedding[spk].append(embedding)
+    if skipped:
+        print(f'Warning: {skipped} utterances skipped (not found in HDF5)')
     for k, v in spk2embedding.items():
         spk2embedding[k] = torch.tensor(v).mean(dim=0).tolist()
     torch.save(utt2embedding, "{}/utt2embedding.pt".format(args.dir))
@@ -55,6 +84,11 @@ if __name__ == "__main__":
     parser.add_argument("--dir", type=str)
     parser.add_argument("--onnx_path", type=str)
     parser.add_argument("--num_thread", type=int, default=8)
+    parser.add_argument("--hdf5_file", type=str, default=None,
+                        help="HDF5 file containing waveforms keyed by utt_id. "
+                             "When set, wav.scp paths are ignored for audio loading.")
+    parser.add_argument("--sample_rate", type=int, default=24000,
+                        help="Sample rate of waveforms stored in the HDF5 file.")
     args = parser.parse_args()
 
     utt2wav, utt2spk = {}, {}

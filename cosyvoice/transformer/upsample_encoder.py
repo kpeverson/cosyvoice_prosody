@@ -15,13 +15,14 @@
 # limitations under the License.
 # Modified from ESPnet(https://github.com/espnet/espnet)
 """Encoder definition."""
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from cosyvoice.transformer.convolution import ConvolutionModule
+from cosyvoice.transformer.embedding import PositionalEncoding
 from cosyvoice.transformer.encoder_layer import ConformerEncoderLayer
 from cosyvoice.transformer.positionwise_feed_forward import PositionwiseFeedForward
 from cosyvoice.utils.class_utils import (
@@ -132,6 +133,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
         cnn_module_norm: str = "batch_norm",
         key_bias: bool = True,
         gradient_checkpointing: bool = False,
+        num_prosody_tokens: int = 0,
     ):
         """
         Args:
@@ -237,9 +239,70 @@ class UpsampleConformerEncoder(torch.nn.Module):
                 normalize_before,
             ) for _ in range(4)
         ])
+        # optional prosody cross-attention (one sublayer per encoder block)
+        # num_prosody_tokens > 0  → option 2: discrete token Embedding
+        # (call init_prosody_encoder() separately for option 3: continuous features)
+        if num_prosody_tokens > 0:
+            self.prosody_embedding = nn.Embedding(num_prosody_tokens, output_size)
+            self.prosody_pos_enc = PositionalEncoding(output_size, dropout_rate)
+            # pre-upsampler: one per encoders block (num_blocks)
+            self.prosody_cross_attn = nn.ModuleList([
+                nn.MultiheadAttention(output_size, attention_heads,
+                                      dropout=attention_dropout_rate, batch_first=True)
+                for _ in range(num_blocks)
+            ])
+            self.prosody_cross_attn_norm = nn.ModuleList([
+                nn.LayerNorm(output_size, eps=1e-5) for _ in range(num_blocks)
+            ])
+            # post-upsampler: one per up_encoders block (4)
+            self.prosody_up_cross_attn = nn.ModuleList([
+                nn.MultiheadAttention(output_size, attention_heads,
+                                      dropout=attention_dropout_rate, batch_first=True)
+                for _ in range(4)
+            ])
+            self.prosody_up_cross_attn_norm = nn.ModuleList([
+                nn.LayerNorm(output_size, eps=1e-5) for _ in range(4)
+            ])
 
     def output_size(self) -> int:
         return self._output_size
+
+    def init_prosody_encoder(self, prosody_encoder_path: str, prosody_feat_dim: int = 768,
+                              prosody_pool_factor: int = 5):
+        """Load a frozen ProsodyEncoder for continuous prosody feature extraction (option 3).
+
+        Creates self.prosody_proj (Linear) and self.prosody_encoder (frozen).
+        A prosody_pos_enc is also created if not already present.
+        """
+        from cosyvoice.prosody.prosody_encoder import ProsodyEncoder
+        output_size = self._output_size
+        self.prosody_encoder = ProsodyEncoder.from_checkpoint(prosody_encoder_path)
+        for p in self.prosody_encoder.parameters():
+            p.requires_grad_(False)
+        self.prosody_proj = nn.Linear(prosody_feat_dim, output_size)
+        self.prosody_pool_factor = prosody_pool_factor
+        if not hasattr(self, 'prosody_pos_enc'):
+            self.prosody_pos_enc = PositionalEncoding(output_size, 0.0)
+
+    def extract_prosody_emb(self, glottal_16k: torch.Tensor,
+                             glottal_16k_len: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Extract and project continuous prosody features from 16 kHz glottal source.
+
+        Returns [B, T', output_size] at ~12.5 Hz (after pool_factor downsampling).
+        """
+        padding_mask = None
+        if glottal_16k_len is not None:
+            max_len = glottal_16k.shape[1]
+            padding_mask = (torch.arange(max_len, device=glottal_16k.device).unsqueeze(0)
+                            >= glottal_16k_len.unsqueeze(1))
+        with torch.no_grad():
+            feats, _ = self.prosody_encoder(glottal_16k, padding_mask)  # [B, T', 768]
+        if self.prosody_pool_factor > 1:
+            B, T, D = feats.shape
+            T_out = T // self.prosody_pool_factor
+            feats = feats[:, :T_out * self.prosody_pool_factor, :].view(
+                B, T_out, self.prosody_pool_factor, D).mean(dim=2)
+        return self.prosody_proj(feats)  # [B, T', output_size]
 
     def forward(
         self,
@@ -249,6 +312,10 @@ class UpsampleConformerEncoder(torch.nn.Module):
         decoding_chunk_size: int = 0,
         num_decoding_left_chunks: int = -1,
         streaming: bool = False,
+        prosody_token: Optional[torch.Tensor] = None,
+        prosody_token_len: Optional[torch.Tensor] = None,
+        glottal_16k: Optional[torch.Tensor] = None,
+        glottal_16k_len: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Embed positions in tensor.
 
@@ -284,11 +351,24 @@ class UpsampleConformerEncoder(torch.nn.Module):
             context, _, _ = self.embed(context, context_masks, offset=xs.size(1))
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks, False, False, 0, self.static_chunk_size if streaming is True else 0, -1)
-        # lookahead + conformer encoder
-        xs = self.pre_lookahead_layer(xs, context=context)
-        xs = self.forward_layers(xs, chunk_masks, pos_emb, mask_pad)
+        # compute prosody embeddings once for use in both encoder stages
+        # option 3 (continuous) takes priority over option 2 (discrete tokens)
+        prosody_emb = None
+        prosody_key_padding_mask = None
+        if glottal_16k is not None and hasattr(self, 'prosody_encoder'):
+            raw_emb = self.extract_prosody_emb(glottal_16k, glottal_16k_len)  # [B, T', D]
+            prosody_emb, _ = self.prosody_pos_enc(raw_emb)
+            # no explicit padding mask needed (extract_prosody_emb returns valid frames only)
+        elif prosody_token is not None and hasattr(self, 'prosody_embedding'):
+            prosody_emb, _ = self.prosody_pos_enc(self.prosody_embedding(prosody_token))  # [B, L_p, D]
+            if prosody_token_len is not None:
+                prosody_key_padding_mask = make_pad_mask(prosody_token_len)  # [B, L_p], True=padding
 
-        # upsample + conformer encoder
+        # lookahead + conformer encoder (pre-upsampler)
+        xs = self.pre_lookahead_layer(xs, context=context)
+        xs = self.forward_layers(xs, chunk_masks, pos_emb, mask_pad, prosody_emb, prosody_key_padding_mask)
+
+        # upsample + conformer encoder (post-upsampler)
         xs = xs.transpose(1, 2).contiguous()
         xs, xs_lens = self.up_layer(xs, xs_lens)
         xs = xs.transpose(1, 2).contiguous()
@@ -297,7 +377,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
         xs, pos_emb, masks = self.up_embed(xs, masks)
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks, False, False, 0, self.static_chunk_size * self.up_layer.stride if streaming is True else 0, -1)
-        xs = self.forward_up_layers(xs, chunk_masks, pos_emb, mask_pad)
+        xs = self.forward_up_layers(xs, chunk_masks, pos_emb, mask_pad, prosody_emb, prosody_key_padding_mask)
 
         if self.normalize_before:
             xs = self.after_norm(xs)
@@ -307,15 +387,33 @@ class UpsampleConformerEncoder(torch.nn.Module):
         return xs, masks
 
     def forward_layers(self, xs: torch.Tensor, chunk_masks: torch.Tensor,
-                       pos_emb: torch.Tensor,
-                       mask_pad: torch.Tensor) -> torch.Tensor:
-        for layer in self.encoders:
+                       pos_emb: torch.Tensor, mask_pad: torch.Tensor,
+                       prosody_emb: torch.Tensor = None,
+                       prosody_key_padding_mask: torch.Tensor = None) -> torch.Tensor:
+        for i, layer in enumerate(self.encoders):
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
+            if prosody_emb is not None and hasattr(self, 'prosody_cross_attn'):
+                residual = xs
+                xs_norm = self.prosody_cross_attn_norm[i](xs)
+                xs_ca, _ = self.prosody_cross_attn[i](
+                    query=xs_norm, key=prosody_emb, value=prosody_emb,
+                    key_padding_mask=prosody_key_padding_mask,
+                )
+                xs = residual + xs_ca
         return xs
 
     def forward_up_layers(self, xs: torch.Tensor, chunk_masks: torch.Tensor,
-                          pos_emb: torch.Tensor,
-                          mask_pad: torch.Tensor) -> torch.Tensor:
-        for layer in self.up_encoders:
+                          pos_emb: torch.Tensor, mask_pad: torch.Tensor,
+                          prosody_emb: torch.Tensor = None,
+                          prosody_key_padding_mask: torch.Tensor = None) -> torch.Tensor:
+        for i, layer in enumerate(self.up_encoders):
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
+            if prosody_emb is not None and hasattr(self, 'prosody_up_cross_attn'):
+                residual = xs
+                xs_norm = self.prosody_up_cross_attn_norm[i](xs)
+                xs_ca, _ = self.prosody_up_cross_attn[i](
+                    query=xs_norm, key=prosody_emb, value=prosody_emb,
+                    key_padding_mask=prosody_key_padding_mask,
+                )
+                xs = residual + xs_ca
         return xs

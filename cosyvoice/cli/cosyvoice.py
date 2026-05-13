@@ -18,6 +18,7 @@ from tqdm import tqdm
 from hyperpyyaml import load_hyperpyyaml
 from modelscope import snapshot_download
 import torch
+import torchaudio
 from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model, CosyVoice3Model
 from cosyvoice.utils.file_utils import logging
@@ -173,6 +174,48 @@ class CosyVoice2(CosyVoice):
                                 trt_concurrent,
                                 self.fp16)
         del configs
+
+    def inference_zero_shot_with_prosody_tokens(self, tts_text, prompt_text, prompt_wav, prosody_tokens, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS conditioned on prosody tokens (list of int, vocabulary matches training km clusters)."""
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_zero_shot_with_prosody(i, prompt_text, prompt_wav, self.sample_rate, prosody_tokens, zero_shot_spk_id)
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
+
+    def inference_zero_shot_with_prosody_encoder(self, tts_text, prompt_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS with prosody features extracted on-the-fly from prompt audio.
+
+        The LLM and flow models must have been initialized with init_prosody_encoder()
+        (i.e. trained with option 3 or set up for continuous prosody features).
+        Glottal source is extracted from prompt_wav, passed through the frozen ProsodyEncoder,
+        and used to condition both the LLM and the flow model.
+        """
+        from cosyvoice.prosody.glottal import extract_glottal_source
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        # Extract glottal source from prompt audio once (shared across sentences)
+        prompt_wav_resampled = torchaudio.functional.resample(
+            prompt_wav, self.sample_rate, 16000) if self.sample_rate != 16000 else prompt_wav
+        glottal = extract_glottal_source(prompt_wav_resampled.squeeze(0), src_sample_rate=16000)
+        glottal_16k = glottal.unsqueeze(0).unsqueeze(0)  # [1, 1, T] → reshape for batch
+        glottal_16k = glottal_16k.squeeze(1)              # [1, T]
+        glottal_16k_len = torch.tensor([glottal_16k.shape[1]], dtype=torch.int32)
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_wav, self.sample_rate, zero_shot_spk_id)
+            model_input['glottal_16k'] = glottal_16k
+            model_input['glottal_16k_len'] = glottal_16k_len
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
 
     def inference_instruct2(self, tts_text, instruct_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):

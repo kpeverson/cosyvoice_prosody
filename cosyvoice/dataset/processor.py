@@ -197,6 +197,28 @@ def compute_whisper_fbank(data, num_frames=-1, mode='train'):
         yield sample
 
 
+def compute_glottal(data, mode='train'):
+    """ Extract glottal source signal at 16 kHz for online prosody feature extraction.
+
+        Requires speech_16k to already be present (set by compute_whisper_fbank).
+        Adds 'glottal_16k' (1-D float32 tensor) to each sample.
+
+        Args:
+            data: Iterable[{..., speech_16k}]
+
+        Returns:
+            Iterable[{..., speech_16k, glottal_16k}]
+    """
+    from cosyvoice.prosody.glottal import get_default_extractor
+    extractor = get_default_extractor()
+    for sample in data:
+        assert 'speech_16k' in sample, 'compute_glottal requires speech_16k; add compute_whisper_fbank first'
+        wav_16k = sample['speech_16k'].squeeze(0)   # [T]
+        glottal = extractor.extract(wav_16k)         # numpy float32 [T]
+        sample['glottal_16k'] = torch.from_numpy(glottal)
+        yield sample
+
+
 def compute_f0(data, sample_rate, hop_size, mode='train'):
     """ Extract f0
 
@@ -404,6 +426,14 @@ def padding(data, use_spk_embedding, mode='train', gan=False, dpo=False):
             instruct_token = [torch.tensor(sample[i]['instruct_token']) for i in order]
             batch['instruct_token_len'] = torch.tensor([i.size(0) for i in instruct_token], dtype=torch.int32)
             batch['instruct_token'] = pad_sequence(instruct_token, batch_first=True, padding_value=0)
+        if torch.tensor(['prosody_token' in sample[i] for i in order]).all():
+            prosody_token = [torch.tensor(sample[i]['prosody_token']) for i in order]
+            batch['prosody_token_len'] = torch.tensor([i.size(0) for i in prosody_token], dtype=torch.int32)
+            batch['prosody_token'] = pad_sequence(prosody_token, batch_first=True, padding_value=0)
+        if torch.tensor(['glottal_16k' in sample[i] for i in order]).all():
+            glottal = [sample[i]['glottal_16k'] for i in order]
+            batch['glottal_16k_len'] = torch.tensor([g.size(0) for g in glottal], dtype=torch.int32)
+            batch['glottal_16k'] = pad_sequence(glottal, batch_first=True, padding_value=0.0)
         if torch.tensor(['whisper_feat' in sample[i] for i in order]).all():
             whisper_feat = [sample[i]['whisper_feat'] for i in order]
             batch['whisper_feat_len'] = torch.tensor([i.size(0) for i in whisper_feat], dtype=torch.int32)

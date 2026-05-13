@@ -188,6 +188,14 @@ class CosyVoiceFrontEnd:
         model_input['text_len'] = tts_text_token_len
         return model_input
 
+    def frontend_zero_shot_with_prosody(self, tts_text, prompt_text, prompt_wav, resample_rate, prosody_tokens, zero_shot_spk_id=''):
+        model_input = self.frontend_zero_shot(tts_text, prompt_text, prompt_wav, resample_rate, zero_shot_spk_id)
+        prosody_token = torch.tensor([prosody_tokens], dtype=torch.int32).to(self.device)
+        prosody_token_len = torch.tensor([len(prosody_tokens)], dtype=torch.int32).to(self.device)
+        model_input['prosody_token'] = prosody_token
+        model_input['prosody_token_len'] = prosody_token_len
+        return model_input
+
     def frontend_cross_lingual(self, tts_text, prompt_wav, resample_rate, zero_shot_spk_id):
         model_input = self.frontend_zero_shot(tts_text, '', prompt_wav, resample_rate, zero_shot_spk_id)
         # in cross lingual mode, we remove prompt in llm
