@@ -139,7 +139,7 @@ class CosyVoice:
 
 class CosyVoice2(CosyVoice):
 
-    def __init__(self, model_dir, load_jit=False, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1):
+    def __init__(self, model_dir, load_jit=False, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1, prosody_encoder_path=''):
         self.model_dir = model_dir
         self.fp16 = fp16
         if not os.path.exists(model_dir):
@@ -161,6 +161,10 @@ class CosyVoice2(CosyVoice):
             load_jit, load_trt, load_vllm, fp16 = False, False, False, False
             logging.warning('no cuda device, set load_jit/load_trt/load_vllm/fp16 to False')
         self.model = CosyVoice2Model(configs['llm'], configs['flow'], configs['hift'], fp16)
+        if prosody_encoder_path:
+            self.model.llm.init_prosody_encoder(prosody_encoder_path)
+            self.model.flow.encoder.init_prosody_encoder(prosody_encoder_path)
+            logging.info('Initialized prosody encoder from {}'.format(prosody_encoder_path))
         self.model.load('{}/llm.pt'.format(model_dir),
                         '{}/flow.pt'.format(model_dir),
                         '{}/hift.pt'.format(model_dir))
@@ -188,27 +192,175 @@ class CosyVoice2(CosyVoice):
                 yield model_output
                 start_time = time.time()
 
-    def inference_zero_shot_with_prosody_encoder(self, tts_text, prompt_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
-        """Zero-shot TTS with prosody features extracted on-the-fly from prompt audio.
+    def inference_zero_shot_with_prosody_tokens_spkemb_only(self, tts_text, prompt_wav_path, prosody_tokens, stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS with prosody tokens, using prompt_wav only for speaker embedding.
 
-        The LLM and flow models must have been initialized with init_prosody_encoder()
-        (i.e. trained with option 3 or set up for continuous prosody features).
-        Glottal source is extracted from prompt_wav, passed through the frozen ProsodyEncoder,
-        and used to condition both the LLM and the flow model.
+        No prompt text, no token prefix, no mel condition in the flow model.
+        Speaker identity comes from the x-vector; prosody from the provided tokens.
         """
-        from cosyvoice.prosody.glottal import extract_glottal_source
-        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
-        # Extract glottal source from prompt audio once (shared across sentences)
-        prompt_wav_resampled = torchaudio.functional.resample(
-            prompt_wav, self.sample_rate, 16000) if self.sample_rate != 16000 else prompt_wav
-        glottal = extract_glottal_source(prompt_wav_resampled.squeeze(0), src_sample_rate=16000)
-        glottal_16k = glottal.unsqueeze(0).unsqueeze(0)  # [1, 1, T] → reshape for batch
-        glottal_16k = glottal_16k.squeeze(1)              # [1, T]
-        glottal_16k_len = torch.tensor([glottal_16k.shape[1]], dtype=torch.int32)
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
-            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_wav, self.sample_rate, zero_shot_spk_id)
-            model_input['glottal_16k'] = glottal_16k
-            model_input['glottal_16k_len'] = glottal_16k_len
+            tts_text_token, tts_text_token_len = self.frontend._extract_text_token(i)
+            embedding = self.frontend._extract_spk_embedding(prompt_wav_path)
+            prosody_token = torch.tensor([prosody_tokens], dtype=torch.int32)
+            prosody_token_len = torch.tensor([len(prosody_tokens)], dtype=torch.int32)
+            model_input = {
+                'text': tts_text_token,
+                'text_len': tts_text_token_len,
+                'llm_embedding': embedding,
+                'flow_embedding': embedding,
+                'prosody_token': prosody_token,
+                'prosody_token_len': prosody_token_len,
+            }
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
+
+    def inference_zero_shot_with_prosody_tokens_no_spkemb(self, tts_text, prompt_text, prompt_wav_path, prosody_tokens, stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS with prosody tokens, without a speaker embedding.
+
+        Speaker characteristics must be replicated by the flow model from the prompt
+        speech tokens and mel-spectrogram alone. The x-vector is zeroed out.
+        """
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_zero_shot_with_prosody(i, prompt_text, prompt_wav_path, self.sample_rate, prosody_tokens)
+            model_input['llm_embedding'] = torch.zeros(1, 192)
+            model_input['flow_embedding'] = torch.zeros(1, 192)
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
+
+    def _wav_to_prosody_emb(self, wav_path):
+        """Extract prosody embedding from a wav file path via glottal source analysis."""
+        from cosyvoice.prosody.glottal import extract_glottal_source
+        wav, sr = torchaudio.load(wav_path)
+        if wav.ndim == 2 and wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        wav_16k = torchaudio.functional.resample(wav, sr, 16000) if sr != 16000 else wav
+        glottal = extract_glottal_source(wav_16k.squeeze(0), src_sample_rate=16000).unsqueeze(0)
+        return self.model.llm.extract_prosody_emb(glottal.to(self.model.device))  # [1, T', D]
+
+    def inference_zero_shot_with_prosody_encoder(self, tts_text, prompt_text, prompt_wav_path, tts_wav_path, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS with prosody features extracted on-the-fly from a prosody reference.
+
+        prompt_wav_path provides speaker identity (x-vector) and the acoustic prompt for the flow model.
+        tts_wav_path provides the prosody style. Prosody features are encoded separately for each
+        audio and concatenated, covering the full [prompt_text + tts_text] span without mixing
+        self-attention context across the two audio sources.
+        """
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        prompt_prosody_emb = self._wav_to_prosody_emb(prompt_wav_path)  # [1, T_prompt', D]
+        tts_prosody_emb = self._wav_to_prosody_emb(tts_wav_path)        # [1, T_tts', D]
+        prosody_emb = torch.cat([prompt_prosody_emb, tts_prosody_emb], dim=1)
+
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_wav_path, self.sample_rate, zero_shot_spk_id)
+            model_input['prosody_emb'] = prosody_emb
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
+
+    def inference_zero_shot_with_prosody_encoder_spkemb_only(self, tts_text, prompt_wav_path, tts_wav_path, stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS with prosody encoder, using prompt_wav only for speaker embedding.
+
+        No prompt text, no token prefix, no mel condition in the flow model.
+        Speaker identity comes from the x-vector; prosody from the encoder applied to both wavs.
+        """
+        # prosody_emb = torch.cat([
+        #     self._wav_to_prosody_emb(prompt_wav_path),
+        #     self._wav_to_prosody_emb(tts_wav_path),
+        # ], dim=1)
+        prosody_emb = self._wav_to_prosody_emb(tts_wav_path)  # only use tts_wav for prosody, to avoid potential speaker info leakage from prompt_wav
+
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            tts_text_token, tts_text_token_len = self.frontend._extract_text_token(i)
+            embedding = self.frontend._extract_spk_embedding(prompt_wav_path)
+            model_input = {
+                'text': tts_text_token,
+                'text_len': tts_text_token_len,
+                'llm_embedding': embedding,
+                'flow_embedding': embedding,
+                'prosody_emb': prosody_emb,
+            }
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
+
+    def inference_zero_shot_with_prosody_encoder_no_spkemb(self, tts_text, prompt_text, prompt_wav_path, tts_wav_path, stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS with prosody encoder, without a speaker embedding.
+
+        Speaker characteristics must be replicated by the flow model from the prompt
+        speech tokens and mel-spectrogram alone. The x-vector is zeroed out.
+        """
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        prosody_emb = torch.cat([
+            self._wav_to_prosody_emb(prompt_wav_path),
+            self._wav_to_prosody_emb(tts_wav_path),
+        ], dim=1)
+
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_wav_path, self.sample_rate, zero_shot_spk_id='')
+            model_input['llm_embedding'] = torch.zeros(1, 192)
+            model_input['flow_embedding'] = torch.zeros(1, 192)
+            model_input['prosody_emb'] = prosody_emb
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
+
+    def inference_zero_shot_spkemb_only(self, tts_text, prompt_wav_path, stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS using prompt_wav only for speaker embedding extraction.
+
+        No prompt text, no token prefix, no mel condition in the flow model.
+        Speaker identity comes entirely from the x-vector.
+        """
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            tts_text_token, tts_text_token_len = self.frontend._extract_text_token(i)
+            embedding = self.frontend._extract_spk_embedding(prompt_wav_path)
+            model_input = {
+                'text': tts_text_token,
+                'text_len': tts_text_token_len,
+                'llm_embedding': embedding,
+                'flow_embedding': embedding,
+            }
+            start_time = time.time()
+            logging.info('synthesis text {}'.format(i))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                yield model_output
+                start_time = time.time()
+
+    def inference_zero_shot_no_spkemb(self, tts_text, prompt_text, prompt_wav_path, stream=False, speed=1.0, text_frontend=True):
+        """Zero-shot TTS without a speaker embedding.
+
+        Speaker characteristics must be replicated by the flow model from the prompt
+        speech tokens and mel-spectrogram alone. The x-vector is zeroed out.
+        """
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_wav_path, self.sample_rate, zero_shot_spk_id='')
+            model_input['llm_embedding'] = torch.zeros(1, 192)
+            model_input['flow_embedding'] = torch.zeros(1, 192)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
             for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
