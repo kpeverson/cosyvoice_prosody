@@ -316,6 +316,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
         prosody_token_len: Optional[torch.Tensor] = None,
         glottal_16k: Optional[torch.Tensor] = None,
         glottal_16k_len: Optional[torch.Tensor] = None,
+        prosody_emb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Embed positions in tensor.
 
@@ -352,10 +353,11 @@ class UpsampleConformerEncoder(torch.nn.Module):
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks, False, False, 0, self.static_chunk_size if streaming is True else 0, -1)
         # compute prosody embeddings once for use in both encoder stages
-        # option 3 (continuous) takes priority over option 2 (discrete tokens)
-        prosody_emb = None
+        # pre-computed > option 3 (continuous) > option 2 (discrete tokens)
         prosody_key_padding_mask = None
-        if glottal_16k is not None and hasattr(self, 'prosody_encoder'):
+        if prosody_emb is not None:
+            prosody_emb, _ = self.prosody_pos_enc(prosody_emb.to(xs.device))  # already encoded, just add pos enc
+        elif glottal_16k is not None and hasattr(self, 'prosody_encoder'):
             raw_emb = self.extract_prosody_emb(glottal_16k, glottal_16k_len)  # [B, T', D]
             prosody_emb, _ = self.prosody_pos_enc(raw_emb)
             # no explicit padding mask needed (extract_prosody_emb returns valid frames only)
