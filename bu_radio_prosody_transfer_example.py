@@ -1,58 +1,76 @@
-
-from cosyvoice.cli.cosyvoice import CosyVoice2
-from cosyvoice.utils.file_utils import load_wav
+import argparse
+import os
 import torchaudio
+from cosyvoice.cli.cosyvoice import CosyVoice2
 
-bu_radio_dir = "/gscratch/tial/data/bu_radio"
-model_path = "/gscratch/tial/kpever/workspace/CosyVoice/examples/gigaspeech/cosyvoice2/exp/combined_models/llm_w_prosody_epoch3_flow_w_prosody_epoch29"
+INFERENCE_MODES = ['standard', 'spkemb_only', 'no_spkemb']
 
-utt_ids = ["f1ajrlp1", "f2bjrlp1", "m3bjrlp1"]
+UTT_IDS = ["f1ajrlp1", "f2bjrlp1", "m3bjrlp1"]
+INPUTS_DIR = "/gscratch/tial/kpever/workspace/CosyVoice/bu_radio_example_outputs/inputs"
 
-cosyvoice = CosyVoice2(model_path, load_jit=False, load_trt=False)
 
-def get_bu_radio_sentence(txt_path):
-    with open(txt_path, "r") as f:
-        full_str = f.read()
-    full_str = " ".join(full_str.split())
-    sentences = full_str.split(". ")
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', required=True, help='path to CosyVoice2 model directory')
+    parser.add_argument('--mode', default='standard', choices=INFERENCE_MODES,
+                        help='standard: full zero-shot + prosody tokens; '
+                             'spkemb_only: x-vector only, no prompt prefix in flow; '
+                             'no_spkemb: prompt tokens+mel in flow, zeroed x-vector')
+    parser.add_argument('--output_dir', default='bu_radio_example_outputs/prosody_transfer_outputs',
+                        help='directory to write output wavs')
+    parser.add_argument('--prosody_encoder_path', default='',
+                        help='path to prosodyenc_weights.pt; required when model was trained with continuous prosody encoder')
+    return parser.parse_args()
 
-    return sentences
 
-def get_sentence_from_txt_path(txt_path):
-    with open(txt_path, "r") as f:
-        full_str = f.read()
-    return full_str.strip()
+def read_txt(path):
+    with open(path) as f:
+        return f.read().strip()
 
-def get_prosody_tokens_from_txt_path(txt_path):
-    with open(txt_path, "r") as f:
-        full_str = f.readline().strip()
-    tokens = [int(x) for x in full_str.split()]
 
-    return tokens
+def read_prosody_tokens(path):
+    with open(path) as f:
+        return [int(x) for x in f.readline().strip().split()]
 
-for utt_id in utt_ids:
-    
-    spkr = utt_id[:3]
 
-    tts_sentence = get_sentence_from_txt_path(f"/gscratch/tial/kpever/workspace/CosyVoice/bu_radio_example_outputs/inputs/{utt_id}_trimmed.txt")
-    print(f"TTS sentence: {tts_sentence}")
+def main():
+    args = get_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    cosyvoice = CosyVoice2(args.model_path, load_jit=False, load_trt=False, prosody_encoder_path=args.prosody_encoder_path)
 
-    prompt_sentence = get_sentence_from_txt_path(f"/gscratch/tial/kpever/workspace/CosyVoice/bu_radio_example_outputs/inputs/{utt_id}_prompt.txt")
-    print(f"Prompt sentence: {prompt_sentence}")
+    for utt_id in UTT_IDS:
+        tts_sentence = read_txt(f"{INPUTS_DIR}/{utt_id}_trimmed.txt")
+        prompt_sentence = read_txt(f"{INPUTS_DIR}/{utt_id}_prompt.txt")
+        prompt_speech_path = f"{INPUTS_DIR}/{utt_id}_prompt.wav"
+        prompt_tokens = read_prosody_tokens(f"{INPUTS_DIR}/{utt_id}_prompt_tokens.txt")
 
-    prompt_speech_path = f"/gscratch/tial/kpever/workspace/CosyVoice/bu_radio_example_outputs/inputs/{utt_id}_prompt.wav"
+        print(f"[{utt_id}] TTS: {tts_sentence}")
+        print(f"[{utt_id}] Prompt: {prompt_sentence}")
 
-    prompt_tokens = get_prosody_tokens_from_txt_path(f"/gscratch/tial/kpever/workspace/CosyVoice/bu_radio_example_outputs/inputs/{utt_id}_prompt_tokens.txt")
+        for prosody_utt_id in UTT_IDS:
+            if args.prosody_encoder_path:
+                # tts_wav, _ = torchaudio.load(f"{INPUTS_DIR}/{prosody_utt_id}_trimmed.wav")
+                tts_speech_path = f"{INPUTS_DIR}/{prosody_utt_id}_trimmed.wav"
+                gen = cosyvoice.inference_zero_shot_with_prosody_encoder(
+                    tts_sentence, prompt_sentence, prompt_speech_path, tts_speech_path)
+            else:
+                prosody_tokens = read_prosody_tokens(f"{INPUTS_DIR}/{prosody_utt_id}_trimmed_speech_tokens.txt")
+                combined_tokens = prompt_tokens + prosody_tokens
 
-    for prosody_utt_id in utt_ids:
-        prosody_tokens = get_prosody_tokens_from_txt_path(f"/gscratch/tial/kpever/workspace/CosyVoice/bu_radio_example_outputs/inputs/{prosody_utt_id}_trimmed_speech_tokens.txt")
+                if args.mode == 'standard':
+                    gen = cosyvoice.inference_zero_shot_with_prosody_tokens(
+                        tts_sentence, prompt_sentence, prompt_speech_path, prosody_tokens=combined_tokens)
+                elif args.mode == 'spkemb_only':
+                    gen = cosyvoice.inference_zero_shot_with_prosody_tokens_spkemb_only(
+                        tts_sentence, prompt_speech_path, prosody_tokens=combined_tokens)
+                elif args.mode == 'no_spkemb':
+                    gen = cosyvoice.inference_zero_shot_with_prosody_tokens_no_spkemb(
+                        tts_sentence, prompt_sentence, prompt_speech_path, prosody_tokens=combined_tokens)
 
-        prompt_tts_tokens = prompt_tokens + prosody_tokens
+            for i, out in enumerate(gen):
+                out_path = os.path.join(args.output_dir, f"{utt_id}_prosody_from_{prosody_utt_id}.wav")
+                torchaudio.save(out_path, out['tts_speech'].cpu(), cosyvoice.sample_rate)
 
-        for i, j in enumerate(cosyvoice.inference_zero_shot_with_prosody_tokens(
-            tts_sentence,
-            prompt_sentence,
-            prompt_speech_path,
-            prosody_tokens=prompt_tts_tokens,
-        )):
-            torchaudio.save(f"bu_radio_example_outputs/prosody_transfer_outputs/gigaspeech_llm_w_prosody_gigaspeech_flow_w_prosody/{utt_id}_prosody_from_{prosody_utt_id}.wav", j["tts_speech"].cpu(), cosyvoice.sample_rate)
+
+if __name__ == '__main__':
+    main()
