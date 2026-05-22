@@ -591,6 +591,7 @@ class Qwen2LM(TransformerLM):
             prosody_token: Optional[torch.Tensor] = None,
             prosody_token_len: Optional[torch.Tensor] = None,
             glottal_16k: Optional[torch.Tensor] = None,
+            prosody_emb: Optional[torch.Tensor] = None,
     ) -> Generator[torch.Tensor, None, None]:
         device = text.device
         text = torch.concat([prompt_text, text], dim=1)
@@ -614,8 +615,10 @@ class Qwen2LM(TransformerLM):
         else:
             prompt_speech_token_emb = torch.zeros(1, 0, self.llm_input_size, dtype=text_emb.dtype).to(device)
 
-        # Determine prosody embedding: option 3 (continuous) > option 2 (discrete) > none
-        if glottal_16k is not None and hasattr(self, 'prosody_encoder'):
+        # Determine prosody embedding: pre-computed > option 3 (continuous) > option 2 (discrete) > none
+        if prosody_emb is not None:
+            prosody_emb = prosody_emb.to(device)  # [1, T', D] pre-computed by caller
+        elif glottal_16k is not None and hasattr(self, 'prosody_encoder'):
             prosody_emb = self.extract_prosody_emb(glottal_16k.to(device))  # [1, T', D]
         elif (prosody_token is not None and prosody_token_len is not None
               and hasattr(self, 'prosody_embedding') and prosody_token_len > 0):

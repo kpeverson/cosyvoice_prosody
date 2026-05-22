@@ -270,7 +270,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   prosody_token=None,
                   prosody_token_len=None,
                   glottal_16k=None,
-                  glottal_16k_len=None):
+                  glottal_16k_len=None,
+                  prosody_emb=None):
         assert token.shape[0] == 1
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
@@ -287,14 +288,16 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                                         prosody_token=prosody_token,
                                         prosody_token_len=prosody_token_len,
                                         glottal_16k=glottal_16k,
-                                        glottal_16k_len=glottal_16k_len)
+                                        glottal_16k_len=glottal_16k_len,
+                                        prosody_emb=prosody_emb)
         else:
             token, context = token[:, :-self.pre_lookahead_len], token[:, -self.pre_lookahead_len:]
             h, h_lengths = self.encoder(token, token_len, context=context, streaming=streaming,
                                         prosody_token=prosody_token,
                                         prosody_token_len=prosody_token_len,
                                         glottal_16k=glottal_16k,
-                                        glottal_16k_len=glottal_16k_len)
+                                        glottal_16k_len=glottal_16k_len,
+                                        prosody_emb=prosody_emb)
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
 

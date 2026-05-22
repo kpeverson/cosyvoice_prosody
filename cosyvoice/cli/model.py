@@ -106,7 +106,7 @@ class CosyVoiceModel:
         input_names = ["x", "mask", "mu", "cond"]
         return {'min_shape': min_shape, 'opt_shape': opt_shape, 'max_shape': max_shape, 'input_names': input_names}
 
-    def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid, prosody_token=None, prosody_token_len=None, glottal_16k=None):
+    def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid, prosody_token=None, prosody_token_len=None, glottal_16k=None, prosody_emb=None):
         cur_silent_token_num, max_silent_token_num = 0, 5
         with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
             if isinstance(text, Generator):
@@ -128,7 +128,8 @@ class CosyVoiceModel:
                                                      uuid=uuid,
                                                      prosody_token=prosody_token.to(self.device) if prosody_token is not None else None,
                                                      prosody_token_len=prosody_token_len.to(self.device) if prosody_token_len is not None else None,
-                                                     glottal_16k=glottal_16k.to(self.device) if glottal_16k is not None else None)
+                                                     glottal_16k=glottal_16k.to(self.device) if glottal_16k is not None else None,
+                                                     prosody_emb=prosody_emb.to(self.device) if prosody_emb is not None else None)
             for i in token_generator:
                 if i in self.silent_tokens:
                     cur_silent_token_num += 1
@@ -300,7 +301,7 @@ class CosyVoice2Model(CosyVoiceModel):
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers
 
-    def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0, prosody_token=None, prosody_token_len=None, glottal_16k=None, glottal_16k_len=None):
+    def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0, prosody_token=None, prosody_token_len=None, glottal_16k=None, glottal_16k_len=None, prosody_emb=None):
         with torch.cuda.amp.autocast(self.fp16):
             tts_mel, _ = self.flow.inference(token=token.to(self.device, dtype=torch.int32),
                                              token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
@@ -314,7 +315,8 @@ class CosyVoice2Model(CosyVoiceModel):
                                              prosody_token=prosody_token.to(self.device) if prosody_token is not None else None,
                                              prosody_token_len=prosody_token_len.to(self.device) if prosody_token_len is not None else None,
                                              glottal_16k=glottal_16k.to(self.device) if glottal_16k is not None else None,
-                                             glottal_16k_len=glottal_16k_len.to(self.device) if glottal_16k_len is not None else None)
+                                             glottal_16k_len=glottal_16k_len.to(self.device) if glottal_16k_len is not None else None,
+                                             prosody_emb=prosody_emb.to(self.device) if prosody_emb is not None else None)
         tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
         # append hift cache
         if self.hift_cache_dict[uuid] is not None:
@@ -347,6 +349,7 @@ class CosyVoice2Model(CosyVoiceModel):
             prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32),
             prosody_token=None, prosody_token_len=None,
             glottal_16k=None, glottal_16k_len=None,
+            prosody_emb=None,
             stream=False, speed=1.0, **kwargs):
         # this_uuid is used to track variables related to this inference thread
         this_uuid = str(uuid.uuid1())
@@ -356,7 +359,7 @@ class CosyVoice2Model(CosyVoiceModel):
         if source_speech_token.shape[1] == 0:
             p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid),
                                  kwargs={'prosody_token': prosody_token, 'prosody_token_len': prosody_token_len,
-                                         'glottal_16k': glottal_16k})
+                                         'glottal_16k': glottal_16k, 'prosody_emb': prosody_emb})
         else:
             p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
         p.start()
@@ -379,7 +382,8 @@ class CosyVoice2Model(CosyVoiceModel):
                                                      prosody_token=prosody_token,
                                                      prosody_token_len=prosody_token_len,
                                                      glottal_16k=glottal_16k,
-                                                     glottal_16k_len=glottal_16k_len)
+                                                     glottal_16k_len=glottal_16k_len,
+                                                     prosody_emb=prosody_emb)
                     token_offset += this_token_hop_len
                     self.token_hop_len = min(self.token_max_hop_len, self.token_hop_len * self.stream_scale_factor)
                     yield {'tts_speech': this_tts_speech.cpu()}
